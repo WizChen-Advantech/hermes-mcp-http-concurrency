@@ -17,11 +17,67 @@ changes nothing; Hermes then behaves exactly as without it.
 
 from __future__ import annotations
 
+import contextvars
 import logging
+import os
+import threading
+import time
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
 _MARK = "_mcp_http_concurrency_patched"
+# The first calls after start-up are logged with how many HTTP calls were in
+# flight at that moment, so "did they really run together?" can be answered
+# from the gateway log. Then it goes quiet.
+_TRACE_CALLS = 60
+_trace_lock = threading.Lock()
+_trace = {"seen": 0, "in_flight": 0}
+# Each call runs in its own asyncio task, so its start time is per call here,
+# not on the lock object every session shares.
+_call_started: contextvars.ContextVar[float] = contextvars.ContextVar("mcp_http_call_started")
+
+
+def _trace_enter(server_name: str) -> float:
+    with _trace_lock:
+        _trace["in_flight"] += 1
+        _trace["seen"] += 1
+        seen, in_flight = _trace["seen"], _trace["in_flight"]
+    if seen <= _TRACE_CALLS:
+        logger.info("mcp-http-concurrency: call #%d to %s starts, %d HTTP call(s) in flight",
+                    seen, server_name, in_flight)
+    return time.monotonic()
+
+
+def _trace_exit(server_name: str, started: float) -> None:
+    with _trace_lock:
+        _trace["in_flight"] -= 1
+        seen = _trace["seen"]
+    if seen <= _TRACE_CALLS:
+        logger.info("mcp-http-concurrency: a call to %s ended after %.1fs",
+                    server_name, time.monotonic() - started)
+
+
+def _environment() -> str:
+    """Versions and proxy hosts (never credentials), for reading the log."""
+    parts = []
+    try:
+        from importlib.metadata import version
+        for dist in ("hermes-agent", "mcp", "httpx"):
+            try:
+                parts.append(f"{dist}={version(dist)}")
+            except Exception:  # noqa: BLE001
+                parts.append(f"{dist}=?")
+    except Exception:  # noqa: BLE001
+        pass
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY"):
+        value = os.environ.get(name)
+        if value:
+            host = urlsplit(value if "://" in value else f"http://{value}")
+            parts.append(f"{name}={host.hostname}:{host.port or ''}")
+    if os.environ.get("NO_PROXY") or os.environ.get("no_proxy"):
+        parts.append("NO_PROXY=set")
+    return " ".join(parts)
 
 
 class _HttpAwareLock:
@@ -44,11 +100,15 @@ class _HttpAwareLock:
     async def __aenter__(self):
         if not self._http():
             await self._lock.acquire()
+        else:
+            _call_started.set(_trace_enter(getattr(self._server, "name", "?")))
         return None
 
     async def __aexit__(self, exc_type, exc, tb):
         if not self._http():
             self._lock.release()
+        else:
+            _trace_exit(getattr(self._server, "name", "?"), _call_started.get(time.monotonic()))
         return False
 
     def locked(self) -> bool:
@@ -91,7 +151,7 @@ def apply() -> bool:
         if _wrap(server):
             wrapped.append(name)
     logger.info("mcp-http-concurrency: HTTP MCP calls run in parallel "
-                "(already connected: %s)", ", ".join(wrapped) or "none")
+                "(already connected: %s; %s)", ", ".join(wrapped) or "none", _environment())
     return True
 
 

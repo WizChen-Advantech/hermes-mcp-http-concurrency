@@ -43,6 +43,13 @@ hermes plugins enable mcp-http-concurrency
 The gateway log then shows
 `mcp-http-concurrency: HTTP MCP calls run in parallel (already connected: ...)`.
 
+The same line also records the installed `hermes-agent`, `mcp` and `httpx` versions and
+any proxy host set in the environment (host and port only). For the first 60 HTTP tool
+calls after start-up the plugin logs how many were in flight
+(`call #N to <server> starts, K HTTP call(s) in flight`), then goes quiet. If K reaches 2+
+here but your MCP server still receives the calls one by one, the queue is below Hermes
+(for example an egress proxy), not in it.
+
 To undo, disable the plugin and restart the gateway.
 
 ## Safety
