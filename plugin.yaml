@@ -1,0 +1,5 @@
+name: mcp-http-concurrency
+version: 0.1.0
+description: Let MCP calls to HTTP servers run in parallel instead of one at a time per server.
+author: Wiz.Chen
+kind: standalone
